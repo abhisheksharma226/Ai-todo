@@ -2,6 +2,7 @@
   "name": "ai-todo",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "generate": "drizzle-kit generate",
     "migrate": "drizzle-kit migrate",
@@ -20,6 +21,7 @@
     "dotenv": "^16.4.7",
     "drizzle-orm": "^0.39.1",
     "openai": "^4.82.0",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "readline-sync": "^1.4.10"
   }
 }
