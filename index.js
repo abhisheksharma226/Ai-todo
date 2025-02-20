@@ -1,129 +1,165 @@
 import dotenv from "dotenv";
-import { ilike, eq } from 'drizzle-orm';
-import {db} from './db/index.js';
-import { todosTable } from './db/schema.js';
-import OpenAI from "openai";
-import readlineSync from 'readline-sync';
-import { type } from 'os';
-
+import { ilike, eq } from "drizzle-orm";
+import { db } from "./db/index.js";
+import { todosTable } from "./db/schema.js";
+import readlineSync from "readline-sync";
+import fetch from "node-fetch";
 
 dotenv.config();
 
-const client = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY
-});
+const HUGGING_FACE_API_KEY = process.env.HUGGING_FACE_API_KEY;
+const HF_MODEL = "tiiuae/falcon-7b-instruct";
 
+if (!HUGGING_FACE_API_KEY) {
+  console.error("❌ Missing Hugging Face API Key. Please set it in the .env file.");
+  process.exit(1);
+}
+
+// Database functions
 async function getAllTodos() {
-    const todo = await db.select(todosTable).from(todosTable);
-    return todo;
+  return await db.select().from(todosTable);
 }
 
 async function createTodo(todo) {
+  try {
+    if (!todo || typeof todo !== "string") {
+      throw new Error("Invalid todo input");
+    }
+
     const [result] = await db
-        .insert(todosTable)
-        .values({
-        todo,
-})
-        .returning({
-        id: todosTable.id,
-});
-    return result.id;
+      .insert(todosTable)
+      .values({ todo })
+      .returning(["id"]); // Fix returning
+
+    console.log("Inserted Todo:", result);
+    return result?.id;
+  } catch (error) {
+    console.error("Error inserting todo:", error);
+    throw new Error("Failed to create todo");
+  }
 }
 
 
 async function searchTodo(search) {
-    const todo = await db
+  return await db
     .select()
     .from(todosTable)
     .where(ilike(todosTable.todo, `%${search}%`));
-    return todo;
 }
-
 
 async function deleteTodoById(id) {
-    await db.delete(todosTable).where(eq(todosTable.id, id));
+  await db.delete(todosTable).where(eq(todosTable.id, id));
 }
-
 
 const tools = {
-    getAllTodos : getAllTodos,
-    createTodo : createTodo,
-    searchTodo : searchTodo,
-    deleteTodoById : deleteTodoById,
-}
+  getAllTodos,
+  createTodo,
+  searchTodo,
+  deleteTodoById,
+};
 
 const SYSTEM_PROMPT = `
-You are an AI To-Do List Assistant with START, PLAN, ACTION, Obeservation and Output State.
-Wait for the user prompt and first PLAN using available tools.
-After Planning, Take the action with appropriate tools and wait for Observation based on Action.
-Once you get the observations, Return the AI response based on START propmt and observations
-
+You are an AI To-Do List Assistant.
 You can manage tasks by adding, viewing, updating, and deleting them.
-You must strictly follow the JSON output format.
-
+You must follow the JSON output format.
+Always return a valid JSON object without any additional text. 
+Format: {"status": "success", "message": "Task added successfully"}.
+You are a To-Do List Assistant. Always return a valid JSON object without any additional text.
+You are an AI To-Do List Assistant. Always return a valid JSON object in the format: {\"status\": \"success\", \"message\": \"Task added successfully\"}. No extra text or explanations.
 
 Todo DB Schema:
-id: Int and Primary Key
-todo: String
-created_at: Date Time
-updated_at: Date Time
+- id: Int (Primary Key)
+- todo: String
+- created_at: Date Time
+- updated_at: Date Time
 
 Available Tools:
-- getAllTodos(): Returns all the Todos from Database
-- createTodo (todo: string): Creates a new Todo in the DB and takes todo as a string and return the id of created todo
-- deleteTodoById(id: string): Deleted the todo by ID given in the DB
-- search Todo (query: string): Searches for all todos matching teh query string using iLike in DB
-
-
-Example:
-START
-{ "type": "user", "user": "Add a task for shopping groceries." }
-{ "type": "plan", "plan": "I will try to get more context on what user needs to shop." }
-{ "type": "output", "output": "Can you tell me what all items you want to shop for?" }
-{ "type": "user", "user": "I want to shop for milk, kurkure, lays and choco." }
-{ "type": "plan", "plan": "I will use createTodo to create a new Todo in DB."}
-{ "type": "laction", "function": "createTodo", "input": "Shopping for milk, kurkure, lays and choco."}
-{ "type": "observation", "observation": "2"}
-{ "type": "output", "output": "You todo has been added successfully" }
+- getAllTodos(): Returns all Todos from Database
+- createTodo(todo: string): Creates a new Todo in the DB
+- deleteTodoById(id: string): Deletes a Todo by ID
+- searchTodo(query: string): Searches for todos using iLike in DB
 `;
 
+const messages = [{ role: "system", content: SYSTEM_PROMPT }];
 
-const messages = [{ role: "system", content: SYSTEM_PROMPT }]; 
+async function sendToHuggingFace(prompt) {
+  try {
+    console.log("🔄 Sending request to Hugging Face...");
 
+    const response = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${HUGGING_FACE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ inputs: prompt }),
+    });
 
-while (true) {
+    if (!response.ok) {
+      console.error(`❌ Hugging Face API error: ${response.status} - ${response.statusText}`);
+      return JSON.stringify({ type: "output", output: "Hugging Face API error. Try again later." });
+    }
+
+    const data = await response.json();
+    console.log("✅ Hugging Face Raw Response:", JSON.stringify(data, null, 2));
+
+    if (!Array.isArray(data) || data.length === 0 || !data[0]?.generated_text) {
+      console.error("❌ Invalid Hugging Face response format.");
+      return JSON.stringify({ type: "output", output: "AI response error. Try again." });
+    }
+
+    return data[0].generated_text;
+  } catch (error) {
+    console.error("❌ Error sending request to Hugging Face:", error.message);
+    return JSON.stringify({ type: "output", output: "AI request failed. Try again later." });
+  }
+}
+
+async function main() {
+  console.log("🤖 AI To-Do List Assistant Started!");
+
+  while (true) {
     const query = readlineSync.question(">> ");
-    const userMessage = { 
-        type: 'user', 
-        user: query 
-    };
-
-    messages.push({ role: 'user', content: JSON.stringify(userMessage) });
-
+    messages.push({ role: "user", content: query });
 
     while (true) {
-        const chat = await client.chat.completions.create({
-            model: 'gpt-3.5-turbo',
-            messages: messages,
-            response_format: { type: 'json_object' },
-        }); 
-            const result = chat.choices[0].message.content;
-            messages.push({ role: 'assistant', content: result });
+      const rawResult = await sendToHuggingFace(JSON.stringify(messages));
+      console.log("📥 AI Raw Response:", rawResult);
 
-            const action = JSON.parse(result);
-            if (action.type === 'output'){
-                console.log(`: ${action.output}`);
-                break;
-            }else if(action.type === 'action'){
-                const fn = tools[action.function];
-                if(!fn) throw new Error('Invalid Toll call');
+      let result;
+      try {
+        result = JSON.parse(rawResult);
+      } catch (error) {
+        console.error("❌ Failed to parse AI response:", error.message);
+        console.log(`📝 AI: ${rawResult}`);
+        break;
+      }
 
-                const obeservation = await fn(action.input);
-                const obeservationMessage = {
-                    type: 'observation',
-                    obeservation : obeservation
-                };
-                messages.push({ role: 'developer', content: JSON.stringify(obeservationMessage)});
-            }
+      messages.push({ role: "assistant", content: JSON.stringify(result) });
+
+      if (result.type === "output") {
+        console.log(`✅ AI: ${result.output}`);
+        break;
+      } else if (result.type === "action") {
+        const fn = tools[result.function];
+
+        if (!fn) {
+          console.error(`❌ Invalid function call: ${result.function}`);
+          break;
         }
-}
+
+        try {
+          const observation = await fn(result.input);
+          console.log(`🔹 Function executed: ${result.function}`);
+          const observationMessage = { type: "observation", observation };
+          messages.push({ role: "developer", content: JSON.stringify(observationMessage) });
+        } catch (err) {
+          console.error(`❌ Error executing function ${result.function}: ${err.message}`);
+          break;
+        }
+      }
+    }
+  }
+} // ✅ Ensure this closing bracket is present!
+
+main(); // ✅ Ensure this line is present!
